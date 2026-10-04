@@ -21,7 +21,25 @@ the API. Concurrency model:
   seq) and the full attempt history; retry attempts continue numbering
   from 5 under a fresh 4-attempt budget.
 
-A small control HTTP server (CONTROL_PORT) exists for tests:
+Delivery generations
+--------------------
+Every claimed row carries the ``generation_id`` pinned at ingestion. The
+dispatcher resolves URL+secret for **that** generation (never the
+currently active one) and signs the original raw bytes with it, so
+retries, dead-letter replays and crash requeues always keep the original
+delivery contract, and an activation racing an in-flight claim is decided
+by the persisted row: the database can never say "old generation" while
+bytes are sent to the new endpoint.
+
+If the pinned generation is (temporarily) absent from this worker's
+configuration -- e.g. mid rolling deploy -- the claim is reverted exactly
+(``unclaim``: no failed attempt, no schedule change), the head event stays
+put, the blockage is reported on ``/control/status``, and other targets
+keep flowing. The dispatcher re-checks on every poll, so the queue
+resumes by itself once the config converges.
+
+A small control HTTP server (CONTROL_PORT) exists for tests/ops:
+    GET  /control/status   per-target dispatcher state, incl. blockages
     POST /control/crash  {"event_id": "..."}
         the *next successful* delivery of that event os._exit()s the
         process after the target received the bytes (duplicate-on-restart
@@ -41,16 +59,21 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from config import Clock, load_targets
+from config import Clock, TargetConfigProvider
 from signing import sign
 from storage import Storage
 
 POLL_INTERVAL = 0.03  # seconds of real time between claim polls
+BLOCKED_BACKOFF = 0.5  # extra pause while a target's head is undeliverable
+SUPERVISOR_INTERVAL = 0.5  # config reload / dispatcher spawn cadence
 SOCKET_TIMEOUT = float(os.environ.get("DELIVERY_TIMEOUT", "1.0"))
 
 # event ids that crash the process after a successful send (in-memory only,
 # deliberately not persisted -- it models a real crash, not a durable flag)
 _crash_after: set[str] = set()
+
+# guards the supervisor's dispatcher registry (read by /control/status)
+_dispatchers_lock = threading.Lock()
 
 
 def deliver_once(
@@ -96,12 +119,55 @@ def deliver_once(
 
 
 class Dispatcher:
-    def __init__(self, name: str, spec: dict, storage: Storage, clock: Clock):
+    """One per target. Resolves the delivery contract per claimed event."""
+
+    def __init__(self, name: str, provider: TargetConfigProvider,
+                 storage: Storage, clock: Clock):
         self.name = name
-        self.url = spec["url"]
-        self.secret = spec["secret"]
+        self.provider = provider
         self.storage = storage
         self.clock = clock
+        self._lock = threading.Lock()
+        self._blocked: dict | None = None
+
+    # -------------------------------------------------------- blocked state
+
+    def _set_blocked(self, generation_id, event_id: str) -> None:
+        with self._lock:
+            if self._blocked and self._blocked["head_event_id"] == event_id \
+                    and self._blocked["missing_generation"] == generation_id:
+                return  # keep the original "since"
+            self._blocked = {
+                "missing_generation": generation_id,
+                "head_event_id": event_id,
+                "since": time.time(),
+            }
+        sys.stderr.write(
+            f"[worker] BLOCKED {self.name}: generation "
+            f"{generation_id!r} not in worker config; head event "
+            f"{event_id[:8]} kept in place (no failure recorded)\n"
+        )
+
+    def _clear_blocked(self) -> None:
+        with self._lock:
+            if self._blocked is not None:
+                sys.stderr.write(f"[worker] unblocked {self.name}\n")
+            self._blocked = None
+
+    def status(self) -> dict:
+        with self._lock:
+            blocked = dict(self._blocked) if self._blocked else None
+        return {
+            "blocked": blocked is not None,
+            "missing_generation": blocked["missing_generation"]
+            if blocked else None,
+            "head_event_id": blocked["head_event_id"] if blocked else None,
+            "blocked_since": blocked["since"] if blocked else None,
+            "configured_generations":
+                self.provider.configured_generations(self.name),
+        }
+
+    # ------------------------------------------------------------ main loop
 
     def run(self) -> None:
         sys.stderr.write(f"[worker] dispatcher for target '{self.name}' up\n")
@@ -118,13 +184,30 @@ class Dispatcher:
         now = self.clock.now()
         event = self.storage.claim_next(self.name, now, wall_now=time.time())
         if event is None:
+            self._clear_blocked()
             return
+
+        # Resolve the contract of the *pinned* generation -- not the
+        # currently active one. Missing config is not a delivery failure:
+        # revert the claim exactly and hold the head in place.
+        spec = self.provider.resolve(self.name, event["generation_id"])
+        if spec is None:
+            self.storage.unclaim(
+                event["id"], event["attempt_no"], event["not_before"]
+            )
+            self._set_blocked(event["generation_id"], event["id"])
+            time.sleep(BLOCKED_BACKOFF)
+            return
+        self._clear_blocked()
+
         ts = int(now)
         sys.stderr.write(
             f"[worker] -> {self.name} event={event['id'][:8]} "
-            f"attempt={event['attempt_no']}\n"
+            f"attempt={event['attempt_no']} gen={event['generation_id']}\n"
         )
-        ok, status, error = deliver_once(self.url, self.secret, event, ts)
+        ok, status, error = deliver_once(
+            spec["url"], spec["secret"], event, ts
+        )
         if ok and event["id"] in _crash_after:
             # Deterministic crash *after* the target accepted the bytes
             # but *before* the attempt is recorded: the restarted worker
@@ -149,7 +232,9 @@ class Dispatcher:
         )
 
 
-def make_control_server(storage: Storage, clock: Clock):
+def make_control_server(storage: Storage, clock: Clock,
+                        provider: TargetConfigProvider,
+                        dispatchers: dict):
     class Control(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             pass
@@ -162,8 +247,18 @@ def make_control_server(storage: Storage, clock: Clock):
             self.wfile.write(data)
 
         def do_GET(self):
-            if urlparse(self.path).path == "/healthz":
+            path = urlparse(self.path).path
+            if path == "/healthz":
                 self._reply(200, {"ok": True})
+            elif path == "/control/status":
+                with _dispatchers_lock:
+                    snapshot = dict(dispatchers)
+                self._reply(200, {
+                    "ok": True,
+                    "targets": {
+                        name: d.status() for name, d in snapshot.items()
+                    },
+                })
             else:
                 self._reply(404, {"error": "not found"})
 
@@ -193,27 +288,36 @@ def main() -> None:
     db_path = os.environ["DB_PATH"]
     storage = Storage(db_path)
     clock = Clock(storage)
-    targets = load_targets(os.environ.get("TARGET_CONFIG"))
+    provider = TargetConfigProvider.from_env()
 
     # Recover anything the dead predecessor had in flight (at-least-once).
     recovered = storage.requeue_inflight(clock.now())
     if recovered:
         sys.stderr.write(f"[worker] requeued {recovered} in-flight event(s)\n")
 
-    control = make_control_server(storage, clock)
+    dispatchers: dict[str, Dispatcher] = {}
+    control = make_control_server(storage, clock, provider, dispatchers)
     threading.Thread(target=control.serve_forever, daemon=True).start()
 
-    threads = []
-    for name, spec in targets.items():
-        t = threading.Thread(
-            target=Dispatcher(name, spec, storage, clock).run,
-            name=f"dispatch-{name}", daemon=True,
-        )
-        t.start()
-        threads.append(t)
-    sys.stderr.write(f"[worker] up, dispatching {len(targets)} target(s)\n")
-    for t in threads:
-        t.join()
+    # Supervisor: pick up config-file changes and keep exactly one
+    # dispatcher thread per configured target (new targets appearing in a
+    # rolled-out config get their thread without a restart).
+    sys.stderr.write("[worker] supervisor up\n")
+    while True:
+        try:
+            provider.reload()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+        for name in provider.targets():
+            with _dispatchers_lock:
+                if name in dispatchers:
+                    continue
+                d = Dispatcher(name, provider, storage, clock)
+                dispatchers[name] = d
+            threading.Thread(target=d.run, name=f"dispatch-{name}",
+                             daemon=True).start()
+        time.sleep(SUPERVISOR_INTERVAL)
 
 
 if __name__ == "__main__":

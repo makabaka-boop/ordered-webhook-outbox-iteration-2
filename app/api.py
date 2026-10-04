@@ -9,6 +9,9 @@ POST /v1/events
              signed/delivered -- never re-serialized)
     202 accepted; 400 malformed; 404 target not whitelisted; 409 same
     request id reused with a different body.
+    The stored event pins the target's *current delivery generation*
+    (``generation_id`` in the response) inside the same transaction as the
+    request-id dedup check and the insert.
 GET  /v1/events/{id}
 GET  /v1/events/{id}/attempts
 
@@ -17,6 +20,15 @@ Admin (internal network only)
 GET/POST /admin/clock            virtual clock control for tests
 GET      /admin/events           list events (?status=dead supported)
 POST     /admin/events/{id}/replay
+GET      /admin/targets          whitelist + configured/active generations
+GET      /admin/targets/{name}   (secrets are never exposed)
+POST     /admin/targets/{name}/generations/activate
+         {"generation": "g2", "expected_current": "g1"}
+         Compare-and-swap activation of a *pre-configured* generation:
+         200 on success, 404 unknown target/generation, 409 when the
+         persisted current generation differs from ``expected_current``.
+         Activation -- successful or failed -- never rewrites stored
+         events; only events ingested afterwards pin the new generation.
 GET      /healthz
 """
 
@@ -28,15 +40,15 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from config import Clock, load_targets
+from config import Clock, TargetConfigProvider
 from storage import Storage
 
 MAX_BODY = 1 << 20  # 1 MiB
 
 
-def make_handler(targets: dict, clock: Clock, storage: Storage):
+def make_handler(provider: TargetConfigProvider, clock: Clock, storage: Storage):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "OutboxIngress/1.0"
+        server_version = "OutboxIngress/1.1"
 
         def log_message(self, fmt, *args):
             sys.stderr.write("[api] %s - %s\n" % (self.address_string(), fmt % args))
@@ -65,6 +77,16 @@ def make_handler(targets: dict, clock: Clock, storage: Storage):
                 return None
             return self.rfile.read(length)
 
+        def _target_view(self, name: str) -> dict:
+            return {
+                "target": name,
+                "generations": provider.configured_generations(name),
+                "initial": provider.default_generation(name),
+                "current": storage.get_current_generation(
+                    name, provider.default_generation(name), clock.now()
+                ),
+            }
+
         # ------------------------------------------------------------- GET
 
         def do_GET(self):
@@ -75,6 +97,17 @@ def make_handler(targets: dict, clock: Clock, storage: Storage):
                     self._json(200, {"ok": True, "clock": clock.state()})
                 elif path == "/admin/clock":
                     self._json(200, clock.state())
+                elif path == "/admin/targets":
+                    self._json(
+                        200,
+                        [self._target_view(n) for n in provider.targets()],
+                    )
+                elif path.startswith("/admin/targets/"):
+                    name = path[len("/admin/targets/"):]
+                    if "/" in name or not provider.has_target(name):
+                        self._json(404, {"error": "unknown target"})
+                    else:
+                        self._json(200, self._target_view(name))
                 elif path == "/admin/events":
                     status = None
                     for part in qs.split("&"):
@@ -120,6 +153,13 @@ def make_handler(targets: dict, clock: Clock, storage: Storage):
                     self._set_clock()
                 elif path == "/admin/clock/advance":
                     self._advance_clock()
+                elif path.startswith("/admin/targets/") and path.endswith(
+                    "/generations/activate"
+                ):
+                    name = path[
+                        len("/admin/targets/"): -len("/generations/activate")
+                    ]
+                    self._activate_generation(name)
                 elif path.startswith("/admin/events/") and path.endswith("/replay"):
                     event_id = path[len("/admin/events/"): -len("/replay")]
                     row = storage.replay_dead(event_id, clock.now())
@@ -142,7 +182,7 @@ def make_handler(targets: dict, clock: Clock, storage: Storage):
                     {"error": "X-Target and X-Request-Id headers are required"},
                 )
                 return
-            if target_name not in targets:
+            if not provider.has_target(target_name):
                 self._json(
                     404,
                     {
@@ -163,35 +203,99 @@ def make_handler(targets: dict, clock: Clock, storage: Storage):
                 self._json(400, {"error": "body must be valid JSON"})
                 return
 
-            # Producer dedup: a repeated request id returns the original
-            # event; a collision with a different body is a client error.
-            existing = storage.get_event_by_request(request_id)
-            if existing is not None:
-                same = bytes(existing["payload"]) == body
-                if not same:
+            # Dedup + generation pin + insert are one transaction: a
+            # repeated request id returns the original row (with its
+            # original pinned generation, even if a newer generation has
+            # been activated since); a collision with a different body is
+            # a client error.
+            row, is_new = storage.ingest_event(
+                request_id, target_name, body, clock.now(),
+                provider.default_generation(target_name),
+            )
+            if not is_new:
+                if bytes(row["payload"]) != body:
                     self._json(
                         409,
                         {
                             "error": "X-Request-Id already used with a "
                             "different body",
-                            "event_id": existing["id"],
+                            "event_id": row["id"],
                         },
                     )
                     return
                 self._json(
                     202,
                     {
-                        "event_id": existing["id"],
-                        "status": existing["status"],
+                        "event_id": row["id"],
+                        "status": row["status"],
+                        "generation_id": row["generation_id"],
                         "duplicate": True,
                     },
                 )
                 return
-
-            event_id, _ = storage.insert_event(
-                request_id, target_name, body, clock.now()
+            self._json(
+                202,
+                {
+                    "event_id": row["id"],
+                    "status": row["status"],
+                    "generation_id": row["generation_id"],
+                },
             )
-            self._json(202, {"event_id": event_id, "status": "scheduled"})
+
+        def _activate_generation(self, name: str):
+            if not provider.has_target(name):
+                self._json(404, {"error": "unknown target", "target": name})
+                return
+            body = self._read_body()
+            if body is None:
+                return
+            try:
+                req = json.loads(body)
+            except ValueError:
+                self._json(400, {"error": "invalid JSON"})
+                return
+            generation = req.get("generation")
+            expected = req.get("expected_current")
+            if not isinstance(generation, str) or not generation \
+                    or not isinstance(expected, str) or not expected:
+                self._json(
+                    400,
+                    {"error": "generation and expected_current are required"},
+                )
+                return
+            if generation not in provider.configured_generations(name):
+                self._json(
+                    404,
+                    {
+                        "error": "generation is not pre-configured for "
+                        "this target",
+                        "target": name,
+                        "generation": generation,
+                        "configured": provider.configured_generations(name),
+                    },
+                )
+                return
+            ok, current = storage.activate_generation(
+                name, expected, generation,
+                provider.default_generation(name), clock.now(),
+            )
+            if not ok:
+                # CAS failure: nothing was written; stored events and the
+                # persisted current generation are untouched.
+                self._json(
+                    409,
+                    {
+                        "error": "current generation does not match "
+                        "expected_current",
+                        "target": name,
+                        "current": current,
+                    },
+                )
+                return
+            self._json(
+                200,
+                {"target": name, "previous": expected, "current": generation},
+            )
 
         def _set_clock(self):
             body = self._read_body()
@@ -234,6 +338,7 @@ def _event_dict(row) -> dict:
         "target": row["target"],
         "status": row["status"],
         "seq": row["seq"],
+        "generation_id": row["generation_id"],
         "attempts": row["attempts"],
         "max_attempts": row["max_attempts"],
         "created_at": row["created_at"],
@@ -246,12 +351,12 @@ def _event_dict(row) -> dict:
 
 def main():
     db_path = os.environ["DB_PATH"]
-    targets = load_targets(os.environ.get("TARGET_CONFIG"))
+    provider = TargetConfigProvider.from_env()
     storage = Storage(db_path)
     clock = Clock(storage)
     port = int(os.environ.get("API_PORT", "8080"))
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), make_handler(targets, clock, storage))
-    sys.stderr.write(f"[api] listening on :{port}, targets={list(targets)}\n")
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), make_handler(provider, clock, storage))
+    sys.stderr.write(f"[api] listening on :{port}, targets={provider.targets()}\n")
     httpd.serve_forever()
 
 

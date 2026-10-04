@@ -5,23 +5,37 @@
 #   docker compose build
 #   docker compose run --rm verify
 
-x-targets: &targets
-  # name -> "URL|target-specific signing secret".
-  # This map is fixed AT DEPLOY TIME: ingestion accepts only these target
-  # names and never learns URLs/secrets from request data.
-  TARGET_CONFIG: >-
-    {"a":"http://fake-target:8090/t/a/receive|secret-target-a",
-     "b":"http://fake-target:8090/t/b/receive|secret-target-b",
-     "c":"http://fake-target:8090/t/c/receive|secret-target-c"}
+# The deployment whitelist. Fixed AT DEPLOY TIME: ingestion accepts only
+# these target names and never learns URLs/secrets from request data.
+#
+# Two formats per target (freely mixed):
+#   legacy:  "name": "URL|secret"          (one implicit "legacy" generation)
+#   generations: "name": {"initial": gid,
+#                         "generations": {gid: {"url":..., "secret":...}}}
+#
+# "race"/"dlq"/"d" are multi-generation targets; each generation points at
+# its own fake endpoint with its own secret, so endpoint/key migrations are
+# exercised as genuinely independent receivers.
+x-target-config: &target-config >-
+  {"a":"http://fake-target:8090/t/a/receive|secret-target-a",
+   "b":"http://fake-target:8090/t/b/receive|secret-target-b",
+   "c":"http://fake-target:8090/t/c/receive|secret-target-c",
+   "race":{"initial":"g1","generations":{
+     "g1":{"url":"http://fake-target:8090/t/race-g1/receive","secret":"secret-race-g1"},
+     "g2":{"url":"http://fake-target:8090/t/race-g2/receive","secret":"secret-race-g2"},
+     "g3":{"url":"http://fake-target:8090/t/race-g3/receive","secret":"secret-race-g3"}}},
+   "dlq":{"initial":"h1","generations":{
+     "h1":{"url":"http://fake-target:8090/t/dlq-g1/receive","secret":"secret-dlq-h1"},
+     "h2":{"url":"http://fake-target:8090/t/dlq-g2/receive","secret":"secret-dlq-h2"}}},
+   "d":{"initial":"d1","generations":{
+     "d1":{"url":"http://fake-target:8090/t/d/receive","secret":"secret-target-d"},
+     "d2":{"url":"http://fake-target:8090/t/d2/receive","secret":"secret-target-d2"}}}}
 
 x-common: &common
   image: outbox-app:latest
   build:
     context: .
     dockerfile: Dockerfile
-  environment:
-    <<: *targets
-    DB_PATH: /data/outbox.db
   volumes:
     - outbox-data:/data
   networks:
@@ -32,7 +46,7 @@ services:
     <<: *common
     command: ["python", "/srv/verify/fake_target.py"]
     environment:
-      <<: *targets
+      TARGET_CONFIG: *target-config
       FAKE_PORT: "8090"
     volumes: []
     healthcheck:
@@ -48,7 +62,7 @@ services:
     command: ["python", "-m", "app.api"]
     working_dir: /srv
     environment:
-      <<: *targets
+      TARGET_CONFIG: *target-config
       DB_PATH: /data/outbox.db
       API_PORT: "8080"
     # no host port published by default: verification uses the compose
@@ -69,11 +83,18 @@ services:
     command: ["python", "-m", "app.worker"]
     working_dir: /srv
     environment:
-      <<: *targets
+      # The worker reads its whitelist from a *file* and reloads it when it
+      # changes (rolling config deploys). verify/worker-config/targets.json
+      # starts without target d's old generation "d1" to simulate a rollout
+      # that has not reached the worker yet; the verify service rewrites it.
+      TARGET_CONFIG_FILE: /etc/outbox/targets.json
       DB_PATH: /data/outbox.db
       CONTROL_PORT: "9100"
       DELIVERY_TIMEOUT: "1.0"
     restart: unless-stopped   # restart after the crash test; never loses work
+    volumes:
+      - outbox-data:/data
+      - ./verify/worker-config:/etc/outbox:ro
     depends_on:
       api:
         condition: service_healthy
@@ -95,13 +116,13 @@ services:
     command: ["python", "/srv/verify/verify.py"]
     working_dir: /srv
     environment:
-      <<: *targets
+      TARGET_CONFIG: *target-config
       API_URL: http://api:8080
       FAKE_URL: http://fake-target:8090
       WORKER_CONTROL_URL: http://worker:9100
-      TARGET_SECRETS_JSON: >-
-        {"a":"secret-target-a","b":"secret-target-b","c":"secret-target-c"}
-    volumes: []
+      WORKER_CONFIG_FILE: /worker-config/targets.json
+    volumes:
+      - ./verify/worker-config:/worker-config
     depends_on:
       api:
         condition: service_healthy

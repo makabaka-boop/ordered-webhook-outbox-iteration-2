@@ -11,6 +11,20 @@ disappear.
 Delivery guarantee: **at-least-once**. Duplicate sends after a crash or
 lease expiry are explicitly permitted; consumers must dedupe on
 ``X-Event-Id``/``X-Request-Id``.
+
+Delivery generations
+--------------------
+Each event row pins ``generation_id``: the delivery generation (URL+secret
+contract) that was current for its target when the event was ingested. The
+pin is written inside the same transaction as the dedup check and the
+insert, so an event can never exist without its contracted generation.
+Retries and dead-letter replays keep the pinned generation; only *new*
+events observe a newer activated generation. The per-target "current
+generation" lives in ``target_generations`` (persistent runtime state) and
+is changed only by the admin activation CAS -- which never touches stored
+events. The worker resolves URL+secret exclusively from the row's pinned
+generation, so the database can never say "old generation" while bytes go
+to the new endpoint.
 """
 
 from __future__ import annotations
@@ -56,6 +70,16 @@ CREATE TABLE IF NOT EXISTS attempts (
 );
 CREATE INDEX IF NOT EXISTS idx_attempts_event ON attempts(event_id, attempt_no);
 
+-- Persistent runtime state: which pre-configured delivery generation is
+-- currently active per target. Written only by the admin activation CAS
+-- (and lazily initialized to the config's initial generation on first
+-- sight). Never rewritten for events already stored.
+CREATE TABLE IF NOT EXISTS target_generations (
+    target      TEXT PRIMARY KEY,
+    current_gen TEXT NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS kv (
     k TEXT PRIMARY KEY,
     v TEXT NOT NULL
@@ -83,13 +107,38 @@ class Storage:
         self._conn.execute("PRAGMA busy_timeout=30000;")
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring pre-generation databases forward.
+
+        ``events.generation_id`` is added to existing tables; rows written
+        before generations existed keep NULL, which the worker resolves to
+        the target's initial (legacy) generation -- the endpoint those rows
+        were originally contracted to.
+        """
+        with self._lock:
+            cols = [
+                r[1]
+                for r in self._conn.execute("PRAGMA table_info(events)")
+            ]
+            if "generation_id" not in cols:
+                try:
+                    self._conn.execute(
+                        "ALTER TABLE events ADD COLUMN generation_id TEXT"
+                    )
+                except sqlite3.OperationalError as exc:
+                    # api and worker migrate the same fresh database
+                    # concurrently; the loser's ALTER is a no-op.
+                    if "duplicate column" not in str(exc):
+                        raise
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
 
     def reset_test_state(self) -> None:
-        """Wipe events/attempts and return the clock to real time.
+        """Wipe events/attempts/generation state and reset the clock.
 
         Used by the one-shot verify service so repeated acceptance runs
         against a persistent named volume start from a clean slate.
@@ -98,6 +147,7 @@ class Storage:
             self._conn.execute("BEGIN IMMEDIATE")
             self._conn.execute("DELETE FROM attempts")
             self._conn.execute("DELETE FROM events")
+            self._conn.execute("DELETE FROM target_generations")
             self._conn.execute("DELETE FROM kv")
             self._conn.execute("COMMIT")
 
@@ -145,33 +195,130 @@ class Storage:
             )
         return state
 
+    # ------------------------------------------------- delivery generations
+
+    def _ensure_generation_row(self, target: str, default_generation: str,
+                               now: float) -> str:
+        """Current generation for ``target``, lazily initialized.
+
+        Must be called inside an open transaction (self._lock held).
+        """
+        row = self._conn.execute(
+            "SELECT current_gen FROM target_generations WHERE target=?",
+            (target,),
+        ).fetchone()
+        if row is not None:
+            return row["current_gen"]
+        self._conn.execute(
+            "INSERT INTO target_generations(target, current_gen, updated_at) "
+            "VALUES (?,?,?)",
+            (target, default_generation, now),
+        )
+        return default_generation
+
+    def get_current_generation(self, target: str, default_generation: str,
+                               now: float) -> str:
+        """Read (initializing if needed) the active generation of a target."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._ensure_generation_row(
+                    target, default_generation, now
+                )
+                self._conn.execute("COMMIT")
+                return current
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def activate_generation(
+        self,
+        target: str,
+        expected_current: str,
+        new_generation: str,
+        default_generation: str,
+        now: float,
+    ) -> tuple[bool, str]:
+        """Compare-and-swap the active generation of ``target``.
+
+        Succeeds only if the persisted current generation equals
+        ``expected_current``; returns ``(True, new_generation)``. On
+        mismatch nothing is written and ``(False, actual_current)`` is
+        returned. Activation -- successful or not -- never rewrites stored
+        events; it only decides which generation *future* ingests pin.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._ensure_generation_row(
+                    target, default_generation, now
+                )
+                if current != expected_current:
+                    self._conn.execute("COMMIT")
+                    return False, current
+                self._conn.execute(
+                    "UPDATE target_generations SET current_gen=?, "
+                    "updated_at=? WHERE target=?",
+                    (new_generation, now, target),
+                )
+                self._conn.execute("COMMIT")
+                return True, new_generation
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
     # --------------------------------------------------------------- events
 
-    def insert_event(
-        self, request_id: str, target: str, payload: bytes, now: float
-    ) -> tuple[str, bool]:
-        """Insert an event. Returns (event_id, is_new).
+    def ingest_event(
+        self,
+        request_id: str,
+        target: str,
+        payload: bytes,
+        now: float,
+        default_generation: str,
+    ) -> tuple[sqlite3.Row, bool]:
+        """Deduplicate and insert an event in one transaction.
 
-        If ``request_id`` already exists the original event id is returned
-        with ``is_new=False`` (producer-side dedup). The payload must match
-        the original; the API layer checks that beforehand.
+        The pinned ``generation_id`` is the target's current generation
+        *as read inside this same transaction*, so the dedup check, the
+        generation read and the insert are atomic with respect to
+        concurrent ingests and activations.
+
+        Returns ``(row, is_new)``. When the request id already exists the
+        stored row is returned unchanged (``is_new=False``); its pinned
+        generation is *not* re-evaluated -- a duplicate delivery always
+        keeps the original contract.
         """
         event_id = uuid.uuid4().hex
         with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
+                existing = self._conn.execute(
+                    "SELECT * FROM events WHERE request_id=?", (request_id,)
+                ).fetchone()
+                if existing is not None:
+                    self._conn.execute("COMMIT")
+                    return existing, False
+                generation = self._ensure_generation_row(
+                    target, default_generation, now
+                )
                 self._conn.execute(
                     "INSERT INTO events(id, request_id, target, payload, "
                     "status, not_before, seq, attempts, max_attempts, "
-                    "created_at) VALUES (?,?,?,?, 'scheduled', ?, "
-                    "(SELECT COALESCE(MAX(seq),0)+1 FROM events), 0, 4, ?)",
-                    (event_id, request_id, target, payload, now, now),
+                    "created_at, generation_id) VALUES (?,?,?,?, "
+                    "'scheduled', ?, (SELECT COALESCE(MAX(seq),0)+1 FROM "
+                    "events), 0, 4, ?, ?)",
+                    (event_id, request_id, target, payload, now, now,
+                     generation),
                 )
-                return event_id, True
-            except sqlite3.IntegrityError:
                 row = self._conn.execute(
-                    "SELECT id FROM events WHERE request_id=?", (request_id,)
+                    "SELECT * FROM events WHERE id=?", (event_id,)
                 ).fetchone()
-                return row["id"], False
+                self._conn.execute("COMMIT")
+                return row, True
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def get_event(self, event_id: str) -> Optional[sqlite3.Row]:
         with self._lock:
@@ -241,6 +388,10 @@ class Storage:
         flight or not yet due (not_before), no younger row may be taken.
         ``now`` is logical (controllable) time; ``wall_now`` is the real
         wall clock stamped into ``locked_at`` for crash diagnostics.
+
+        The returned dict carries the row's pinned ``generation_id`` and
+        its pre-claim ``not_before`` (so a claim that cannot be delivered
+        at all can be reverted exactly via ``unclaim``).
         """
         if wall_now is None:
             wall_now = now
@@ -284,7 +435,41 @@ class Storage:
                     "payload": bytes(head["payload"]),
                     "attempt_no": attempt_no,
                     "max_attempts": head["max_attempts"],
+                    "generation_id": head["generation_id"],
+                    "not_before": head["not_before"],
                 }
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def unclaim(self, event_id: str, attempt_no: int,
+                not_before: float) -> bool:
+        """Revert a claim *without* recording an outcome.
+
+        Used when delivery is impossible for a non-event reason -- the
+        pinned generation's URL/secret is (temporarily) absent from the
+        worker's configuration. This is not a failed attempt: the attempts
+        counter, the attempt history row and the original schedule are
+        restored exactly, so the head event stays in place, keeps its
+        4-attempt budget and blocks nothing but its own target.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
+                    "UPDATE events SET status='scheduled', "
+                    "attempts=attempts-1, locked_at=NULL, not_before=? "
+                    "WHERE id=? AND status='in_flight' AND attempts=?",
+                    (not_before, event_id, attempt_no),
+                )
+                if cur.rowcount == 1:
+                    self._conn.execute(
+                        "DELETE FROM attempts WHERE event_id=? AND "
+                        "attempt_no=?",
+                        (event_id, attempt_no),
+                    )
+                self._conn.execute("COMMIT")
+                return cur.rowcount == 1
             except BaseException:
                 self._conn.execute("ROLLBACK")
                 raise
@@ -360,7 +545,10 @@ class Storage:
 
         Identity (event id, request id, payload, seq) and the full attempt
         history are preserved; subsequent attempt numbers continue
-        monotonically (5, 6, ...) and ``replayed_count`` grows.
+        monotonically (5, 6, ...) and ``replayed_count`` grows. The pinned
+        ``generation_id`` is deliberately untouched: a replayed event keeps
+        its original delivery contract even if a newer generation has since
+        been activated.
         """
         with self._lock:
             row = self._conn.execute(

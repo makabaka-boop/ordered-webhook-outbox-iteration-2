@@ -1,20 +1,23 @@
 """Fake HTTP target(s) for verification.
 
-One process impersonates every whitelisted target. Target ``name`` receives
-deliveries at ``/t/<name>/receive``; the worker is configured with
-``TARGET_CONFIG`` URLs that point at those paths and this service uses the
-same config to know each target's signing secret.
+One process impersonates every receive endpoint of every whitelisted
+target -- including every *delivery generation* of multi-generation
+targets. A generation with URL ``http://fake-target:8090/t/<ep>/receive``
+is served as endpoint ``<ep>`` with that generation's own signing secret,
+so "old endpoint / new endpoint" migrations are exercised as two fully
+independent fake endpoints with independent receipt logs.
 
-Per target it supports scripted behavior:
+Per endpoint it supports scripted behavior:
     {"fail_first": N, "fail_status": 500}   first N requests fail, rest 200
     {"timeout_first": N, "sleep": 2.0}      first N requests sleep (the
                                             worker times out but the bytes
                                             were received and are recorded)
 Every request -- including ones whose client gave up -- is recorded as a
-receipt: headers, exact raw body and HMAC validity. Admin API:
-    GET    /t/<name>/receipts
-    DELETE /t/<name>/receipts
-    POST   /t/<name>/behavior
+receipt: headers, exact raw body and HMAC validity (checked against the
+endpoint's own generation secret). Admin API:
+    GET    /t/<ep>/receipts
+    DELETE /t/<ep>/receipts
+    POST   /t/<ep>/behavior
     GET    /healthz
 """
 
@@ -29,11 +32,11 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from config import load_targets
+from config import parse_targets
 from signing import verify
 
 _lock = threading.Lock()
-# name -> {"receipts": [...], "behavior": {...}, "counter": int}
+# endpoint -> {"receipts": [...], "behavior": {...}, "counter": int}
 _state: dict[str, dict] = {}
 
 
@@ -43,8 +46,28 @@ def _bucket(name: str) -> dict:
     )
 
 
+def endpoint_secrets(parsed_targets: dict) -> dict[str, str]:
+    """Map receive-endpoint name -> signing secret.
+
+    Walks every generation of every configured target and derives the
+    endpoint name from the URL path convention ``/t/<endpoint>/receive``.
+    """
+    endpoints: dict[str, str] = {}
+    for tname, tspec in parsed_targets.items():
+        for gid, gen in tspec["generations"].items():
+            path = urlparse(gen["url"]).path
+            if not (path.startswith("/t/") and path.endswith("/receive")):
+                raise ValueError(
+                    f"target {tname} generation {gid}: URL path {path!r} "
+                    "does not match /t/<endpoint>/receive"
+                )
+            endpoint = path[len("/t/"): -len("/receive")]
+            endpoints[endpoint] = gen["secret"]
+    return endpoints
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FakeTarget/1.0"
+    server_version = "FakeTarget/1.1"
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[fake] " + (fmt % args) + "\n")
@@ -68,9 +91,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/healthz":
-            self._reply(200, {"ok": True, "targets": list(_state)})
+            self._reply(200, {"ok": True, "endpoints": list(_state)})
             return
-        prefix, ok = self._target_path(path, "receipts")
+        prefix, ok = self._endpoint_path(path, "receipts")
         if ok:
             with _lock:
                 self._reply(200, {"receipts": list(_bucket(prefix)["receipts"])})
@@ -79,7 +102,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlparse(self.path).path
-        prefix, ok = self._target_path(path, "receipts")
+        prefix, ok = self._endpoint_path(path, "receipts")
         if ok:
             with _lock:
                 _bucket(prefix)["receipts"] = []
@@ -94,8 +117,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path.endswith("/behavior"):
             prefix = path[len("/t/"): -len("/behavior")]
-            if prefix not in TARGETS:
-                self._reply(404, {"error": "unknown target"})
+            if prefix not in ENDPOINTS:
+                self._reply(404, {"error": "unknown endpoint"})
                 return
             length = int(self.headers.get("Content-Length", "0"))
             behavior = json.loads(self.rfile.read(length) or b"{}")
@@ -111,8 +134,8 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, {"error": "not found"})
             return
         name = path[len("/t/"): -len("/receive")]
-        if name not in TARGETS:
-            self._reply(404, {"error": "unknown target"})
+        if name not in ENDPOINTS:
+            self._reply(404, {"error": "unknown endpoint"})
             return
 
         length = int(self.headers.get("Content-Length", "0"))
@@ -121,7 +144,7 @@ class Handler(BaseHTTPRequestHandler):
         sig = self.headers.get("X-Signature", "")
         event_id = self.headers.get("X-Event-Id", "")
         request_id = self.headers.get("X-Request-Id", "")
-        sig_ok = verify(TARGETS[name]["secret"], int(ts or "0"), raw, sig)
+        sig_ok = verify(ENDPOINTS[name], int(ts or "0"), raw, sig)
 
         with _lock:
             bucket = _bucket(name)
@@ -164,23 +187,23 @@ class Handler(BaseHTTPRequestHandler):
             # and the signed receipt stands; the broken write is recorded.
             receipt["responded"] = "client_gone"
 
-    def _target_path(self, path: str, suffix: str) -> tuple[str, bool]:
+    def _endpoint_path(self, path: str, suffix: str) -> tuple[str, bool]:
         if path.startswith("/t/") and path.endswith("/" + suffix):
             name = path[len("/t/"): -len("/" + suffix)]
-            if name in TARGETS:
+            if name in ENDPOINTS:
                 return name, True
         return "", False
 
 
-TARGETS = load_targets(os.environ.get("TARGET_CONFIG"))
+ENDPOINTS = endpoint_secrets(parse_targets(os.environ.get("TARGET_CONFIG")))
 
 
 def main() -> None:
     port = int(os.environ.get("FAKE_PORT", "8090"))
-    for name in TARGETS:
+    for name in ENDPOINTS:
         _bucket(name)
     httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    sys.stderr.write(f"[fake] listening on :{port}, targets={list(TARGETS)}\n")
+    sys.stderr.write(f"[fake] listening on :{port}, endpoints={list(ENDPOINTS)}\n")
     httpd.serve_forever()
 
 
