@@ -6,13 +6,16 @@
 #   docker compose run --rm verify
 
 x-targets: &targets
-  # name -> "URL|target-specific signing secret".
-  # This map is fixed AT DEPLOY TIME: ingestion accepts only these target
-  # names and never learns URLs/secrets from request data.
+  # Targets a-c use the legacy one-generation "URL|secret" form. Target m
+  # preconfigures v1/v2; admin CAS activation selects v2 for later events.
   TARGET_CONFIG: >-
     {"a":"http://fake-target:8090/t/a/receive|secret-target-a",
      "b":"http://fake-target:8090/t/b/receive|secret-target-b",
-     "c":"http://fake-target:8090/t/c/receive|secret-target-c"}
+     "c":"http://fake-target:8090/t/c/receive|secret-target-c",
+     "m":{"initial_generation_id":"v1","generations":[
+       {"id":"v1","url":"http://fake-target:8090/t/m/generations/v1/receive","secret":"secret-m-v1"},
+       {"id":"v2","url":"http://fake-target:8090/t/m/generations/v2/receive","secret":"secret-m-v2"}
+     ]}}
 
 x-common: &common
   image: outbox-app:latest
@@ -100,7 +103,7 @@ services:
       FAKE_URL: http://fake-target:8090
       WORKER_CONTROL_URL: http://worker:9100
       TARGET_SECRETS_JSON: >-
-        {"a":"secret-target-a","b":"secret-target-b","c":"secret-target-c"}
+        {"a":"secret-target-a","b":"secret-target-b","c":"secret-target-c","m":{"v1":"secret-m-v1","v2":"secret-m-v2"}}
     volumes: []
     depends_on:
       api:

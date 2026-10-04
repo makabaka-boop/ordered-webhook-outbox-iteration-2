@@ -20,6 +20,9 @@ Checks (in order):
   7. signed delivery over the original raw JSON bytes (with target secret)
   8. worker crash after receipt -> duplicate on restart, no event lost;
      the system explicitly provides at-least-once, never exactly-once
+  9. preconfigured delivery generations: CAS activation, activation/in-flight
+     ordering, generation-pinned retries/DLQ/restart, dual endpoint signing,
+     missing-contract blocking and other-target progress
 """
 
 from __future__ import annotations
@@ -33,6 +36,8 @@ import time
 import urllib.error
 import urllib.request
 
+from config import load_targets
+
 API = os.environ.get("API_URL", "http://api:8080")
 FAKE = os.environ.get("FAKE_URL", "http://fake-target:8090")
 WORKER_CTRL = os.environ.get("WORKER_CONTROL_URL", "http://worker:9100")
@@ -42,6 +47,7 @@ FAIL = "\033[31mFAIL\033[0m"
 _results: list[tuple[str, bool, str]] = []
 
 BASE_TS = 2_000_000_000  # fixed virtual-clock epoch used across the suite
+TARGET_CONFIG = load_targets(os.environ.get("TARGET_CONFIG"))
 
 
 class TimePusher:
@@ -191,6 +197,75 @@ def receipts(target: str) -> list[dict]:
 
 def clear(target: str) -> None:
     http("DELETE", f"{FAKE}/t/{target}/receipts", expect=200)
+
+
+def generation_behavior(target: str, generation: str, spec: dict) -> None:
+    http(
+        "POST",
+        f"{FAKE}/t/{target}/generations/{generation}/behavior",
+        json.dumps(spec).encode(),
+        {"Content-Type": "application/json"},
+        expect=200,
+    )
+
+
+def generation_receipts(target: str, generation: str) -> list[dict]:
+    return http(
+        "GET", f"{FAKE}/t/{target}/generations/{generation}/receipts",
+        expect=200,
+    )[1]["receipts"]
+
+
+def clear_generation(target: str, generation: str) -> None:
+    http(
+        "DELETE",
+        f"{FAKE}/t/{target}/generations/{generation}/receipts",
+        expect=200,
+    )
+
+
+def activate_generation(target: str, generation: str,
+                        expected: str | None = None,
+                        expect: int = 200):
+    body = {} if expected is None else \
+        {"expected_current_generation_id": expected}
+    return http(
+        "POST",
+        f"{API}/admin/targets/{target}/generations/{generation}/activate",
+        json.dumps(body).encode(),
+        {"Content-Type": "application/json"},
+        expect=expect,
+    )
+
+
+def get_target(target: str) -> dict:
+    return http("GET", f"{API}/admin/targets/{target}", expect=200)[1]
+
+
+def get_blocked() -> list[dict]:
+    return http("GET", WORKER_CTRL + "/control/blocked", expect=200)[1][
+        "blocked"
+    ]
+
+
+def control_post(path: str, body: dict, expect: int = 200):
+    return http(
+        "POST", WORKER_CTRL + path, json.dumps(body).encode(),
+        {"Content-Type": "application/json"}, expect=expect,
+    )
+
+
+def wait_until(predicate, timeout: float = 10.0, interval: float = 0.05,
+               message: str = "condition"):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = predicate()
+        if last:
+            return last
+        time.sleep(interval)
+    raise AssertionError(f"timed out waiting for {message}; last={last}")
+
 
 
 def check(name: str, fn):
@@ -449,6 +524,225 @@ def test_worker_crash_restart():
           "system provides at-least-once, not exactly-once")
 
 
+def test_delivery_generations():
+    """Preconfigured generations pin each event's URL, key and lifecycle."""
+    target_name = "m"
+    v1_secret = TARGET_CONFIG[target_name]["generations"]["v1"]["secret"]
+    v2_secret = TARGET_CONFIG[target_name]["generations"]["v2"]["secret"]
+    clear_generation(target_name, "v1")
+    clear_generation(target_name, "v2")
+    clear("a")
+
+    target = get_target(target_name)
+    assert target["current_generation_id"] == "v1", target
+    assert [g["id"] for g in target["generations"]] == ["v1", "v2"]
+
+    # CAS activation and whitelist checks. A failed activation must not
+    # change durable current state.
+    code, body = activate_generation(
+        target_name, "v2", expected="v0", expect=409
+    )
+    assert body["current"] == "v1", body
+    assert get_target(target_name)["current_generation_id"] == "v1"
+    code, _ = http(
+        "POST",
+        f"{API}/admin/targets/{target_name}/generations/v9/activate",
+        b"{}", {"Content-Type": "application/json"},
+    )
+    assert code == 404
+
+    t = BASE_TS + 800
+    freeze(t)
+    # The first old attempt reaches v1 and blocks in a real 2-second target
+    # sleep while the worker's 1-second socket timeout fires.
+    generation_behavior(
+        target_name, "v1",
+        {"timeout_first": 1, "sleep": 2.0},
+    )
+    slow = post_event(target_name, "gen-slow", b'{"phase":"inflight"}')
+    slow_id = slow["event_id"]
+    assert slow["generation_id"] == "v1"
+    wait_until(lambda: len(get_attempts(slow_id)) == 1,
+               message="first v1 attempt started")
+
+    # These requests complete and bind v1 while the first event is still
+    # genuinely in flight on the old endpoint.
+    queued_old = post_event(
+        target_name, "gen-old-queued", b'{"phase":"old-queued"}'
+    )["event_id"]
+    old_dead_ids = [
+        post_event(target_name, f"gen-old-dead-{i}",
+                   b'{"phase":"old-dead"}')["event_id"]
+        for i in range(3)
+    ]
+
+    # Activation is persisted while the first request is in flight. The old
+    # attempt must finish as v1; only subsequent ingress binds v2.
+    activated = activate_generation(target_name, "v2", expected="v1")[1]
+    assert activated["current_generation_id"] == "v2"
+
+    # Request-id de-duplication is evaluated against the original stored
+    # generation despite activation. Same bytes returns the same event;
+    # different bytes conflicts.
+    duplicate = post_event(target_name, "gen-slow",
+                           b'{"phase":"inflight"}')
+    assert duplicate["duplicate"] is True
+    assert duplicate["event_id"] == slow_id
+    assert duplicate["generation_id"] == "v1"
+    code, _ = http(
+        "POST", API + "/v1/events", b'{"phase":"changed"}',
+        {"Content-Type": "application/json", "X-Target": target_name,
+         "X-Request-Id": "gen-slow"},
+    )
+    assert code == 409
+
+    new1 = post_event(target_name, "gen-new-1", b'{"phase":"new"}')
+    assert new1["generation_id"] == "v2"
+    duplicate_new = post_event(target_name, "gen-new-1",
+                               b'{"phase":"new"}')
+    assert duplicate_new["duplicate"] is True
+    assert duplicate_new["generation_id"] == "v2"
+
+    # The timeout attempt reached the old URL/key and is not rerouted. It
+    # remains one attempt; backoff is anchored to frozen logical time.
+    wait_until(
+        lambda: get_event(slow_id)["status"] == "scheduled" and
+        len(get_attempts(slow_id)) == 1,
+        timeout=5,
+        message="old in-flight attempt time out without a new attempt",
+    )
+    old_first = wait_until(
+        lambda: generation_receipts(target_name, "v1") or None,
+        timeout=5, message="old endpoint receive in-flight request",
+    )[0]
+    assert old_first["event_id"] == slow_id
+    assert old_first["generation_id"] == "v1"
+    assert old_first["url_generation_id"] == "v1"
+    assert old_first["sig_valid"] is True
+
+    # The first two due v1 events are the slow one (whose timeout attempt is
+    # already spent) and the queued event; let those succeed and fail every
+    # later backlog event to create three old-generation dead letters.
+    generation_behavior(
+        target_name, "v1",
+        {"succeed_first": 2, "fail_first": 99, "fail_status": 500},
+    )
+    set_virtual_clock(t + 1)
+    wait_event(slow_id, "delivered", timeout=20)
+    wait_event(queued_old, "delivered", timeout=20)
+    for dead_id in old_dead_ids:
+        wait_event(dead_id, "dead", timeout=40)
+    wait_event(new1["event_id"], "delivered", timeout=20)
+
+    v1_receipts = generation_receipts(target_name, "v1")
+    v2_receipts = generation_receipts(target_name, "v2")
+    assert [r["event_id"] for r in v2_receipts] == [new1["event_id"]]
+    assert all(r["generation_id"] == "v2" and
+               r["url_generation_id"] == "v2" and
+               r["sig_valid"] for r in v2_receipts)
+    assert all(r["generation_id"] == "v1" and
+               r["url_generation_id"] == "v1" and
+               r["sig_valid"] for r in v1_receipts)
+    assert base64.b64decode(v2_receipts[0]["body_b64"]) == \
+        b'{"phase":"new"}'
+    assert get_event(slow_id)["generation_id"] == "v1"
+    assert get_event(new1["event_id"])["generation_id"] == "v2"
+    local_sig = __import__("hmac").new(
+        v2_secret.encode(),
+        str(v2_receipts[0]["timestamp"]).encode() +
+        b"\n" + b'{"phase":"new"}',
+        __import__("hashlib").sha256,
+    ).hexdigest()
+    assert v2_receipts[0]["signature"] == local_sig
+    assert v1_secret != v2_secret
+
+    # DLQ replay of an old event remains old, including its retry attempts.
+    replay_id = old_dead_ids[0]
+    before_count = len(generation_receipts(target_name, "v1"))
+    generation_behavior(
+        target_name, "v1",
+        {"fail_first": 1, "fail_status": 502},
+    )
+    freeze(BASE_TS + 900)
+    replay_row = http(
+        "POST", f"{API}/admin/events/{replay_id}/replay", b"", expect=200
+    )[1]
+    assert replay_row["generation_id"] == "v1"
+    wait_event(replay_id, "delivered", timeout=30)
+    replay_attempts = get_attempts(replay_id)
+    assert [a["attempt_no"] for a in replay_attempts] == \
+        [1, 2, 3, 4, 5, 6]
+    assert replay_attempts[4]["status_code"] == 502
+    assert replay_attempts[5]["ok"] == 1
+    assert all(
+        r["event_id"] != replay_id or r["generation_id"] == "v1"
+        for r in generation_receipts(target_name, "v1") +
+        generation_receipts(target_name, "v2")
+    )
+    assert len(generation_receipts(target_name, "v2")) == 1
+    assert len(generation_receipts(target_name, "v1")) == before_count + 2
+
+    # Temporarily missing old contract: replay is retained at the head, no
+    # attempt is added/failed, and another target still advances.
+    blocked_id = old_dead_ids[1]
+    generation_behavior(target_name, "v1", {"fail_first": 0})
+    freeze(BASE_TS + 950)
+    # Remove the worker's old contract first: replay stores no new attempt
+    # and the re-scheduled head is deterministically retained.
+    removed = TARGET_CONFIG[target_name]["generations"]["v1"]
+    control_post("/control/test/generations/remove",
+                 {"target": target_name, "generation_id": "v1"})
+    http("POST", f"{API}/admin/events/{blocked_id}/replay", b"", expect=200)
+    blocked = wait_until(
+        lambda: [b for b in get_blocked() if b["event_id"] == blocked_id],
+        timeout=5, message="missing-generation block report",
+    )[0]
+    assert blocked["generation_id"] == "v1"
+    assert blocked["reason"] == "generation configuration missing"
+    time.sleep(0.4)
+    assert get_event(blocked_id)["status"] == "scheduled"
+    assert len(get_attempts(blocked_id)) == 4
+    v1_before_restore = len(generation_receipts(target_name, "v1"))
+
+    other = post_event("a", "gen-other-target-progress",
+                       b'{"ok":true}')["event_id"]
+    wait_event(other, "delivered", timeout=10)
+    assert receipts("a")[-1]["event_id"] == other
+
+    # Restoring the same deployment contract unblocks without changing the
+    # event's bound generation.
+    control_post("/control/test/generations/restore",
+                 {"target": target_name, "generation": removed})
+    wait_event(blocked_id, "delivered", timeout=20)
+    assert get_event(blocked_id)["generation_id"] == "v1"
+    assert len(generation_receipts(target_name, "v1")) == \
+        v1_before_restore + 1
+    assert [b for b in get_blocked() if b["event_id"] == blocked_id] == []
+
+    # A replayed old event that crashes after receipt is recovered using the
+    # old endpoint/secret after worker restart.
+    crash_id = old_dead_ids[2]
+    generation_behavior(target_name, "v1", {"fail_first": 0})
+    freeze(BASE_TS + 1000)
+    http("POST", f"{API}/admin/events/{crash_id}/replay", b"", expect=200)
+    wait_until(lambda: get_event(crash_id)["status"] == "scheduled",
+               message="crash replay scheduled")
+    http("POST", WORKER_CTRL + "/control/crash",
+         json.dumps({"event_id": crash_id}).encode(),
+         {"Content-Type": "application/json"}, expect=200)
+    wait_event(crash_id, "delivered", timeout=45)
+    crash_receipts = [
+        r for r in generation_receipts(target_name, "v1")
+        if r["event_id"] == crash_id and
+        int(r["timestamp"]) >= BASE_TS + 1000
+    ]
+    assert len(crash_receipts) == 2, crash_receipts
+    assert all(r["generation_id"] == "v1" and r["sig_valid"]
+               for r in crash_receipts)
+    assert all(r["generation_id"] == "v1" for r in crash_receipts)
+    assert get_event(crash_id)["generation_id"] == "v1"
+
+
 TARGET_SECRETS = json.loads(os.environ.get("TARGET_SECRETS_JSON", "{}"))
 
 
@@ -473,6 +767,8 @@ def main() -> int:
           test_signature_and_raw_bytes)
     check("worker crash -> duplicate on restart, zero event loss",
           test_worker_crash_restart)
+    check("pinned delivery generations across activation and restart",
+          test_delivery_generations)
 
     print()
     failed = [n for n, ok, _ in _results if not ok]
