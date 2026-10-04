@@ -1,0 +1,118 @@
+# Event ingress + persistent outbox + independent worker.
+#
+# Acceptance:
+#   docker compose config --quiet
+#   docker compose build
+#   docker compose run --rm verify
+
+x-targets: &targets
+  # name -> "URL|target-specific signing secret".
+  # This map is fixed AT DEPLOY TIME: ingestion accepts only these target
+  # names and never learns URLs/secrets from request data.
+  TARGET_CONFIG: >-
+    {"a":"http://fake-target:8090/t/a/receive|secret-target-a",
+     "b":"http://fake-target:8090/t/b/receive|secret-target-b",
+     "c":"http://fake-target:8090/t/c/receive|secret-target-c"}
+
+x-common: &common
+  image: outbox-app:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment:
+    <<: *targets
+    DB_PATH: /data/outbox.db
+  volumes:
+    - outbox-data:/data
+  networks:
+    - outbox
+
+services:
+  fake-target:
+    <<: *common
+    command: ["python", "/srv/verify/fake_target.py"]
+    environment:
+      <<: *targets
+      FAKE_PORT: "8090"
+    volumes: []
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/healthz', timeout=3).status==200 else 1)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 1s
+
+  api:
+    <<: *common
+    command: ["python", "-m", "app.api"]
+    working_dir: /srv
+    environment:
+      <<: *targets
+      DB_PATH: /data/outbox.db
+      API_PORT: "8080"
+    # no host port published by default: verification uses the compose
+    # network; publish with a local override if you want to curl the API.
+    depends_on:
+      fake-target:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 1s
+
+  worker:
+    <<: *common
+    command: ["python", "-m", "app.worker"]
+    working_dir: /srv
+    environment:
+      <<: *targets
+      DB_PATH: /data/outbox.db
+      CONTROL_PORT: "9100"
+      DELIVERY_TIMEOUT: "1.0"
+    restart: unless-stopped   # restart after the crash test; never loses work
+    depends_on:
+      api:
+        condition: service_healthy
+      fake-target:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:9100/healthz', timeout=3).status==200 else 1)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 1s
+
+  # One-shot verification job. Depends on the worker being healthy; the
+  # worker itself requeues stale in-flight rows at startup, so ordering
+  # between api init and worker start is not load-bearing.
+  verify:
+    <<: *common
+    command: ["python", "/srv/verify/verify.py"]
+    working_dir: /srv
+    environment:
+      <<: *targets
+      API_URL: http://api:8080
+      FAKE_URL: http://fake-target:8090
+      WORKER_CONTROL_URL: http://worker:9100
+      TARGET_SECRETS_JSON: >-
+        {"a":"secret-target-a","b":"secret-target-b","c":"secret-target-c"}
+    volumes: []
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_healthy
+      fake-target:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  outbox-data:
+
+networks:
+  outbox:
